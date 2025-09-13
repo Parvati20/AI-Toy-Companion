@@ -44,6 +44,7 @@ function App() {
   const [isLoadingResponse, setIsLoadingResponse] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [error, setError] = useState('');
+  const [voices, setVoices] = useState([]);
   const fileInputRef = useRef(null);
   const modelInputRef = useRef(null);
   const audioContextRef = useRef(null);
@@ -51,17 +52,88 @@ function App() {
   const musicGainRef = useRef(null);
   const musicLoopTimerRef = useRef(null);
 
-  const initializeAudio = () => {
-    if (!audioContextRef.current) {
-        try {
-            audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
-        } catch (e) {
-            console.error("Web Audio API is not supported in this browser.");
-        }
+  // --- Audio Effects ---
+  useEffect(() => {
+    if (toyReply) {
+      playSound('reply');
+      speakText(toyReply);
     }
-    // Resume audio context if it was suspended by the browser's autoplay policy
-    if (audioContextRef.current?.state === 'suspended') {
-      audioContextRef.current.resume();
+  }, [toyReply]);
+
+  useEffect(() => {
+    if (actionImage) {
+      playSound('image');
+    }
+  }, [actionImage]);
+  
+  useEffect(() => {
+    if (typeof window.speechSynthesis === 'undefined') {
+        console.warn('Speech Synthesis not supported');
+        return;
+    }
+    const loadVoices = () => {
+        setVoices(window.speechSynthesis.getVoices());
+    };
+    window.speechSynthesis.onvoiceschanged = loadVoices;
+    loadVoices();
+    return () => {
+        window.speechSynthesis.onvoiceschanged = null;
+    };
+  }, []);
+
+  const speakText = (text: string) => {
+    if (typeof window.speechSynthesis === 'undefined' || voices.length === 0) {
+        return;
+    }
+    
+    window.speechSynthesis.cancel(); // Stop any previous speech
+
+    const utterance = new SpeechSynthesisUtterance(text);
+
+    // Voice selection logic for a playful voice
+    let selectedVoice = voices.find(voice => voice.name === 'Google US English');
+    if (!selectedVoice) {
+        selectedVoice = voices.find(voice => voice.lang.startsWith('en') && voice.name.includes('Female'));
+    }
+    if (!selectedVoice) {
+        selectedVoice = voices.find(voice => voice.lang.startsWith('en'));
+    }
+    
+    utterance.voice = selectedVoice || voices[0];
+    utterance.pitch = 1.7; // Higher pitch for cartoon voice
+    utterance.rate = 1.2; // Slightly faster speech
+    utterance.volume = 0.9; // Avoid clipping
+
+    window.speechSynthesis.speak(utterance);
+  };
+
+
+  const initializeAudio = () => {
+    if (audioContextRef.current) {
+      if (audioContextRef.current.state === 'suspended') {
+        audioContextRef.current.resume();
+      }
+      return;
+    }
+
+    try {
+        const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+        audioContextRef.current = audioCtx;
+
+        // The "unlock" pattern. Play a silent buffer on the first interaction.
+        // This is crucial for some browsers like Safari to allow audio playback.
+        const buffer = audioCtx.createBuffer(1, 1, 22050);
+        const source = audioCtx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(audioCtx.destination);
+        source.start(0);
+
+        // Resume if it's still suspended after the unlock trick
+        if (audioCtx.state === 'suspended') {
+            audioCtx.resume();
+        }
+    } catch (e) {
+        console.error("Web Audio API is not supported in this browser.");
     }
   };
   
@@ -244,6 +316,9 @@ function App() {
     initializeAudio();
     playSound('click');
     stopBackgroundMusic();
+    if (window.speechSynthesis) {
+        window.speechSynthesis.cancel();
+    }
     setToyImage(null);
     setToyImagePart(null);
     setToyModel(null);
@@ -357,12 +432,10 @@ function App() {
 
         if (foundText) {
             setToyReply(foundText);
-            playSound('reply');
         }
 
         if (foundImage) {
             setActionImage(foundImage);
-            playSound('image');
         }
 
         if (!foundText && !foundImage) {
