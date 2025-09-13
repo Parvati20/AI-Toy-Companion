@@ -1,0 +1,7 @@
+{
+  "name": "Copy of Copy of AI Toy Companion",
+  "description": "Upload a photo of your toy and bring it to life with AI! Give it commands and see it respond.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
