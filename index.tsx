@@ -1,58 +1,110 @@
 /**
- * @license
- * SPDX-License-Identifier: Apache-2.0
+ * Cleaned and hardened Preact + TypeScript app
+ * - Improved error handling for quota / rate limits
+ * - Exponential backoff retry (for transient errors)
+ * - Safer parsing of generateContent response
+ * - Fixes: FileReader typing, speechSynthesis voices, recognition cleanup,
+ *   URL.revokeObjectURL, audio unlock pattern
+ *
+ * NOTE: keep your API key server-side if possible. If you must call from browser,
+ * make sure it's protected appropriately (CORS, short-lived tokens, etc).
  */
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { render } from 'preact';
-import { useState, useRef, useEffect } from 'preact/hooks';
+// FIX: Add Ref type import for casting ref objects to fix type errors.
+import type { Ref } from 'preact';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { jsx } from 'preact/jsx-runtime';
-import { GoogleGenAI, Type, Modality } from '@google/genai';
+import { GoogleGenAI, Modality } from '@google/genai';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
+// ---------- Configuration ----------
+const SAFE_RETRY_COUNT = 2;
+const RETRY_BASE_DELAY_MS = 800; // exponential backoff base
 
-// --- Helper Functions ---
+// instantiate SDK client (ensure API key set securely in your runtime)
+const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
+
+// Speech recognition compat
+const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+const recognitionPrototype = SpeechRecognition ? new SpeechRecognition() : null;
+
+// ---------- Helpers ----------
 function base64Encode(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onloadend = () => {
-        if (typeof reader.result === 'string') {
-            resolve(reader.result.split(',')[1]);
-        } else {
-            reject(new Error('File could not be read as a string.'));
-        }
+      const result = reader.result;
+      if (typeof result === 'string') {
+        const afterComma = result.split(',')[1] || '';
+        resolve(afterComma);
+      } else {
+        reject(new Error('File could not be read as a string.'));
+      }
     };
-    reader.onerror = reject;
+    reader.onerror = () => reject(new Error('Could not read file.'));
     reader.readAsDataURL(file);
   });
 }
 
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-const recognition = SpeechRecognition ? new SpeechRecognition() : null;
+function isQuotaError(err: any): boolean {
+  if (!err) return false;
+  const msg = String(err.message || err).toLowerCase();
+  return msg.includes('quota') || msg.includes('limit') || msg.includes('exceeded') || msg.includes('rate limit') || msg.includes('429');
+}
 
-// --- App Component ---
+function sleep(ms: number) {
+  return new Promise((res) => setTimeout(res, ms));
+}
+
+// ---------- App ----------
 function App() {
-  const [toyImage, setToyImage] = useState(null); // Data URL for display
-  const [toyImagePart, setToyImagePart] = useState(null); // Gemini API part
-  const [toyModel, setToyModel] = useState(null); // 3D model file
-  const [toyDescription, setToyDescription] = useState('');
-  const [userCommand, setUserCommand] = useState('');
-  const [toyReply, setToyReply] = useState('');
-  const [actionImage, setActionImage] = useState('');
+  // UI states
+  const [toyImage, setToyImage] = useState<string | null>(null); // object URL for display
+  const [toyImagePart, setToyImagePart] = useState<any | null>(null); // inlineData for SDK
+  const [toyModel, setToyModel] = useState<File | null>(null);
+  const [toyDescription, setToyDescription] = useState<string>('');
+  const [userCommand, setUserCommand] = useState<string>('');
+  const [toyReply, setToyReply] = useState<string>('');
+  const [actionImage, setActionImage] = useState<string | null>(null);
   const [isLoadingDescription, setIsLoadingDescription] = useState(false);
   const [isLoadingResponse, setIsLoadingResponse] = useState(false);
   const [isListening, setIsListening] = useState(false);
-  const [error, setError] = useState('');
-  const [voices, setVoices] = useState([]);
-  const fileInputRef = useRef(null);
-  const modelInputRef = useRef(null);
-  const audioContextRef = useRef(null);
-  const musicOscillatorRef = useRef(null);
-  const musicGainRef = useRef(null);
-  const musicLoopTimerRef = useRef(null);
+  const [error, setError] = useState<string>('');
+  const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
+  const [lastSendAt, setLastSendAt] = useState<number>(0);
 
-  // --- Audio Effects ---
+  // refs
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const modelInputRef = useRef<HTMLInputElement | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const recognitionRef = useRef<any | null>(null);
+  const toyImageObjectUrlRef = useRef<string | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
+
+  // initialize recognition once (but don't reuse live instance across sessions)
+  useEffect(() => {
+    if (!SpeechRecognition) return;
+    // We'll clone a fresh recognition instance on each start for safety
+    recognitionRef.current = null;
+    return () => {
+      // cleanup if any
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.onresult = null;
+          recognitionRef.current.onend = null;
+          recognitionRef.current.onerror = null;
+          recognitionRef.current.stop();
+        } catch {}
+        recognitionRef.current = null;
+      }
+    };
+  }, []);
+
+  // speak when toyReply changes
   useEffect(() => {
     if (toyReply) {
       playSound('reply');
@@ -61,426 +113,402 @@ function App() {
   }, [toyReply]);
 
   useEffect(() => {
-    if (actionImage) {
-      playSound('image');
-    }
+    if (actionImage) playSound('image');
   }, [actionImage]);
-  
+
+  // load voices
   useEffect(() => {
-    if (typeof window.speechSynthesis === 'undefined') {
-        console.warn('Speech Synthesis not supported');
-        return;
-    }
-    const loadVoices = () => {
-        setVoices(window.speechSynthesis.getVoices());
+    if (!('speechSynthesis' in window)) return;
+    const load = () => {
+      const vs = window.speechSynthesis.getVoices() || [];
+      setVoices(vs);
     };
-    window.speechSynthesis.onvoiceschanged = loadVoices;
-    loadVoices();
+    window.speechSynthesis.onvoiceschanged = load;
+    load();
     return () => {
-        window.speechSynthesis.onvoiceschanged = null;
+      if (window.speechSynthesis) window.speechSynthesis.onvoiceschanged = null;
     };
   }, []);
 
-  const speakText = (text: string) => {
-    if (typeof window.speechSynthesis === 'undefined' || voices.length === 0) {
-        return;
-    }
-    
-    window.speechSynthesis.cancel(); // Stop any previous speech
-
-    const utterance = new SpeechSynthesisUtterance(text);
-
-    // Voice selection logic for a playful voice
-    let selectedVoice = voices.find(voice => voice.name === 'Google US English');
-    if (!selectedVoice) {
-        selectedVoice = voices.find(voice => voice.lang.startsWith('en') && voice.name.includes('Female'));
-    }
-    if (!selectedVoice) {
-        selectedVoice = voices.find(voice => voice.lang.startsWith('en'));
-    }
-    
-    utterance.voice = selectedVoice || voices[0];
-    utterance.pitch = 1.7; // Higher pitch for cartoon voice
-    utterance.rate = 1.2; // Slightly faster speech
-    utterance.volume = 0.9; // Avoid clipping
-
-    window.speechSynthesis.speak(utterance);
-  };
-
-
+  // ---------- Audio helpers ----------
   const initializeAudio = () => {
     if (audioContextRef.current) {
       if (audioContextRef.current.state === 'suspended') {
-        audioContextRef.current.resume();
+        audioContextRef.current.resume().catch(() => {});
       }
       return;
     }
-
     try {
-        const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
-        audioContextRef.current = audioCtx;
+      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      audioContextRef.current = ctx;
 
-        // The "unlock" pattern. Play a silent buffer on the first interaction.
-        // This is crucial for some browsers like Safari to allow audio playback.
-        const buffer = audioCtx.createBuffer(1, 1, 22050);
-        const source = audioCtx.createBufferSource();
-        source.buffer = buffer;
-        source.connect(audioCtx.destination);
-        source.start(0);
-
-        // Resume if it's still suspended after the unlock trick
-        if (audioCtx.state === 'suspended') {
-            audioCtx.resume();
-        }
-    } catch (e) {
-        console.error("Web Audio API is not supported in this browser.");
-    }
-  };
-  
-  const playSound = (type: 'click' | 'reply' | 'image' | 'success' | 'error' | 'micOn' | 'micOff') => {
-      if (!audioContextRef.current) return;
-      const audioCtx = audioContextRef.current;
-      const now = audioCtx.currentTime;
-
-      const createOscillator = (freq: number) => {
-          const oscillator = audioCtx.createOscillator();
-          oscillator.frequency.setValueAtTime(freq, now);
-          return oscillator;
-      };
-
-      const createGain = (startVolume: number, duration: number) => {
-          const gainNode = audioCtx.createGain();
-          gainNode.gain.setValueAtTime(startVolume, now);
-          gainNode.gain.exponentialRampToValueAtTime(0.0001, now + duration);
-          return gainNode;
-      };
-      
-      switch (type) {
-          case 'click': {
-              const oscillator = createOscillator(800);
-              const gainNode = createGain(0.1, 0.1);
-              oscillator.type = 'triangle';
-              oscillator.connect(gainNode).connect(audioCtx.destination);
-              oscillator.start(now);
-              oscillator.stop(now + 0.1);
-              break;
-          }
-          case 'success': {
-              const oscillator1 = createOscillator(523.25); // C5
-              const oscillator2 = createOscillator(659.25); // E5
-              const gainNode = createGain(0.2, 0.4);
-              [oscillator1, oscillator2].forEach(osc => {
-                  osc.connect(gainNode).connect(audioCtx.destination);
-                  osc.start(now);
-                  osc.stop(now + 0.3);
-              });
-              break;
-          }
-          case 'reply': {
-              const notes = [659.25, 783.99, 987.77]; // E5, G5, B5
-              const gainNode = audioCtx.createGain();
-              gainNode.gain.setValueAtTime(0.2, now);
-              gainNode.gain.exponentialRampToValueAtTime(0.0001, now + 0.5);
-              gainNode.connect(audioCtx.destination);
-
-              notes.forEach((note, i) => {
-                  const osc = createOscillator(note);
-                  osc.type = 'sine';
-                  osc.connect(gainNode);
-                  osc.start(now + i * 0.08);
-                  osc.stop(now + i * 0.08 + 0.1);
-              });
-              break;
-          }
-          case 'image': {
-              const oscillator = createOscillator(400);
-              const gainNode = createGain(0.3, 0.5);
-              oscillator.frequency.exponentialRampToValueAtTime(1200, now + 0.5);
-              oscillator.connect(gainNode).connect(audioCtx.destination);
-              oscillator.start(now);
-              oscillator.stop(now + 0.5);
-              break;
-          }
-          case 'micOn': {
-              const oscillator = createOscillator(440);
-              const gainNode = createGain(0.2, 0.2);
-              oscillator.frequency.exponentialRampToValueAtTime(660, now + 0.15);
-              oscillator.connect(gainNode).connect(audioCtx.destination);
-              oscillator.start(now);
-              oscillator.stop(now + 0.2);
-              break;
-          }
-          case 'micOff': {
-              const oscillator = createOscillator(660);
-              const gainNode = createGain(0.2, 0.2);
-              oscillator.frequency.exponentialRampToValueAtTime(440, now + 0.15);
-              oscillator.connect(gainNode).connect(audioCtx.destination);
-              oscillator.start(now);
-              oscillator.stop(now + 0.2);
-              break;
-          }
-          case 'error': {
-              const oscillator = createOscillator(150);
-              const gainNode = createGain(0.2, 0.5);
-              oscillator.type = 'sawtooth';
-              oscillator.connect(gainNode).connect(audioCtx.destination);
-              oscillator.start(now);
-              oscillator.stop(now + 0.4);
-              break;
-          }
+      // unlock trick (silent buffer)
+      const buffer = ctx.createBuffer(1, 1, 22050);
+      const src = ctx.createBufferSource();
+      src.buffer = buffer;
+      src.connect(ctx.destination);
+      src.start(0);
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
       }
-  };
-
-  const stopBackgroundMusic = () => {
-    if (musicLoopTimerRef.current) {
-        clearTimeout(musicLoopTimerRef.current);
-        musicLoopTimerRef.current = null;
-    }
-    if (musicGainRef.current && audioContextRef.current) {
-        const audioCtx = audioContextRef.current;
-        const now = audioCtx.currentTime;
-        // Fade out
-        musicGainRef.current.gain.cancelScheduledValues(now);
-        musicGainRef.current.gain.setValueAtTime(musicGainRef.current.gain.value, now);
-        musicGainRef.current.gain.linearRampToValueAtTime(0, now + 0.5);
-
-        // Stop the oscillator after the fade-out is complete
-        if (musicOscillatorRef.current) {
-            try {
-                musicOscillatorRef.current.stop(now + 0.5);
-            } catch (e) {
-                // Ignore errors from stopping an already stopped oscillator
-            }
-            musicOscillatorRef.current = null;
-        }
-        musicGainRef.current = null;
+    } catch (err) {
+      console.warn('Audio API not available', err);
     }
   };
-  
-  const playBackgroundMusic = () => {
-    if (!audioContextRef.current || musicLoopTimerRef.current) return;
-    stopBackgroundMusic(); // Clear any residue
 
+  const playSound = (type: 'click' | 'reply' | 'image' | 'success' | 'error' | 'micOn' | 'micOff') => {
     const audioCtx = audioContextRef.current;
+    if (!audioCtx) return;
     const now = audioCtx.currentTime;
 
-    const melody = [
-        { freq: 523.25, duration: 250 }, // C5
-        { freq: 587.33, duration: 250 }, // D5
-        { freq: 659.25, duration: 500 }, // E5
-        { freq: 0, duration: 2000 },     // Rest for 2 seconds
-    ];
-
-    const oscillator = audioCtx.createOscillator();
-    oscillator.type = 'triangle';
-    musicOscillatorRef.current = oscillator;
-
-    const gainNode = audioCtx.createGain();
-    musicGainRef.current = gainNode;
-
-    gainNode.connect(audioCtx.destination);
-    oscillator.connect(gainNode);
-    
-    // Set initial gain to 0 and fade in
-    gainNode.gain.setValueAtTime(0, now);
-    gainNode.gain.linearRampToValueAtTime(0.04, now + 1.0); // Low volume, fade in
-
-    let noteIndex = 0;
-    const scheduleNote = () => {
-        if (!audioContextRef.current) return; // Stop if context is gone
-        const note = melody[noteIndex];
-        const noteTime = audioContextRef.current.currentTime;
-        
-        if (note.freq > 0) {
-            musicOscillatorRef.current.frequency.setValueAtTime(note.freq, noteTime);
-            musicGainRef.current.gain.setTargetAtTime(0.04, noteTime, 0.01);
-        } else {
-            musicGainRef.current.gain.setTargetAtTime(0, noteTime, 0.01);
-        }
-
-        noteIndex = (noteIndex + 1) % melody.length;
-        musicLoopTimerRef.current = setTimeout(scheduleNote, note.duration);
+    const createOsc = (freq: number) => {
+      const o = audioCtx.createOscillator();
+      o.frequency.setValueAtTime(freq, now);
+      return o;
+    };
+    const createGain = (start: number, dur: number) => {
+      const g = audioCtx.createGain();
+      g.gain.setValueAtTime(start, now);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+      return g;
     };
 
-    oscillator.start();
-    scheduleNote();
+    switch (type) {
+      case 'click': {
+        const o = createOsc(800);
+        const g = createGain(0.1, 0.1);
+        o.type = 'triangle';
+        o.connect(g).connect(audioCtx.destination);
+        o.start(now);
+        o.stop(now + 0.1);
+        break;
+      }
+      case 'reply':
+      case 'image':
+      case 'success':
+        // These sounds have been removed as they were perceived as irritating background music.
+        return;
+
+      case 'micOn': {
+        const o = createOsc(440);
+        const g = createGain(0.2, 0.2);
+        o.frequency.exponentialRampToValueAtTime(660, now + 0.12);
+        o.connect(g).connect(audioCtx.destination);
+        o.start(now);
+        o.stop(now + 0.16);
+        break;
+      }
+      case 'micOff': {
+        const o = createOsc(660);
+        const g = createGain(0.2, 0.2);
+        o.frequency.exponentialRampToValueAtTime(440, now + 0.12);
+        o.connect(g).connect(audioCtx.destination);
+        o.start(now);
+        o.stop(now + 0.16);
+        break;
+      }
+      case 'error': {
+        const o = createOsc(150);
+        o.type = 'sawtooth';
+        const g = createGain(0.2, 0.4);
+        o.connect(g).connect(audioCtx.destination);
+        o.start(now);
+        o.stop(now + 0.4);
+        break;
+      }
+    }
   };
 
-  const handleError = (message) => {
+  const speakText = (text: string) => {
+    if (!('speechSynthesis' in window)) return;
+    if (!text) return;
+    try {
+      window.speechSynthesis.cancel();
+    } catch {}
+    const u = new SpeechSynthesisUtterance(text);
+    // choose a voice
+    const preferred = voices.find(v => /google us english/i.test(v.name)) || voices.find(v => v.lang.startsWith('en') && v.name.toLowerCase().includes('female')) || voices.find(v => v.lang.startsWith('en'));
+    if (preferred) u.voice = preferred;
+    u.pitch = 1.5;
+    u.rate = 1.15;
+    u.volume = 0.95;
+    window.speechSynthesis.speak(u);
+  };
+
+  // ---------- Error helper ----------
+  const handleError = (message: string) => {
+    initializeAudio();
     playSound('error');
     setError(message);
-    setTimeout(() => setError(''), 5000);
+    // auto-clear after 6s
+    setTimeout(() => setError(''), 6000);
   };
-  
+
   const startOver = () => {
     initializeAudio();
     playSound('click');
-    stopBackgroundMusic();
-    if (window.speechSynthesis) {
-        window.speechSynthesis.cancel();
-    }
+    if ('speechSynthesis' in window) window.speechSynthesis.cancel();
     setToyImage(null);
     setToyImagePart(null);
     setToyModel(null);
     setToyDescription('');
     setUserCommand('');
     setToyReply('');
-    setActionImage('');
+    setActionImage(null);
     setError('');
-    if (fileInputRef.current) {
-        fileInputRef.current.value = null;
+    if (fileInputRef.current) fileInputRef.current.value = '';
+    if (modelInputRef.current) modelInputRef.current.value = '';
+    if (toyImageObjectUrlRef.current) {
+      URL.revokeObjectURL(toyImageObjectUrlRef.current);
+      toyImageObjectUrlRef.current = null;
     }
-    if (modelInputRef.current) {
-        modelInputRef.current.value = null;
+    // abort any ongoing request
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
     }
-  }
+  };
 
-  const handleFileChange = async (event) => {
-    const file = event.target.files[0];
+  // ---------- File handlers ----------
+  const handleFileChange = async (evt: Event) => {
+    const el = evt.target as HTMLInputElement;
+    const file = el.files ? el.files[0] : null;
     if (!file) return;
-
     if (!file.type.startsWith('image/')) {
-        handleError('Please upload an image file.');
-        return;
+      handleError('Please upload an image file.');
+      return;
     }
 
-    startOver(); // Reset everything before starting
-    setToyImage(URL.createObjectURL(file));
+    startOver();
+    initializeAudio();
+    playSound('click');
+
+    // show quickly
+    const objUrl = URL.createObjectURL(file);
+    toyImageObjectUrlRef.current = objUrl;
+    setToyImage(objUrl);
     setIsLoadingDescription(true);
 
     try {
-      const base64Data = await base64Encode(file);
-      const imagePart = {
-        inlineData: { data: base64Data, mimeType: file.type },
-      };
+      const b64 = await base64Encode(file);
+      const imagePart = { inlineData: { data: b64, mimeType: file.type } };
       setToyImagePart(imagePart);
-      
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: { parts: [imagePart, { text: "Describe this toy in a few simple, friendly words for a child." }] },
-      });
-      setToyDescription(response.text);
-      playSound('success');
-      playBackgroundMusic();
 
+      // call the SDK with retry/backoff
+      let attempt = 0;
+      let lastErr: any = null;
+      while (attempt <= SAFE_RETRY_COUNT) {
+        try {
+          // create abort controller for this request
+          abortControllerRef.current = new AbortController();
+
+          const response = await ai.models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents: { parts: [imagePart, { text: "Describe this toy in a few simple, friendly words for a child." }] },
+            // if SDK supports passing signal, include it
+            // @ts-ignore
+            signal: abortControllerRef.current.signal,
+          });
+          // FIX: Use the recommended .text accessor for the response, which is safer and simpler.
+          // parse safely
+          const parsedText = response.text || '';
+
+          if (parsedText) {
+            setToyDescription(parsedText);
+          } else {
+            setToyDescription('A friendly toy! (Could not get a detailed description.)');
+          }
+          playSound('success');
+          lastErr = null;
+          break; // success
+        } catch (err: any) {
+          lastErr = err;
+          if (isQuotaError(err)) {
+            handleError("Looks like the daily request limit for the AI model has been reached. Please try again tomorrow.");
+            break; // don't retry on quota exceeded
+          }
+          // for transient network errors, retry
+          attempt += 1;
+          if (attempt > SAFE_RETRY_COUNT) {
+            console.error('Final error describing toy:', err);
+            handleError('Could not describe the toy. Please try again.');
+            break;
+          }
+          const backoff = RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
+          await sleep(backoff);
+        } finally {
+          abortControllerRef.current = null;
+        }
+      }
     } catch (err) {
       console.error(err);
-      if (err.toString().toLowerCase().includes('quota')) {
-        handleError("You've reached the daily limit for requests. Please try again tomorrow!");
-      } else {
-        handleError('Could not describe the toy. Please try again.');
+      handleError('Failed to read the image or call the API.');
+      // cleanup image preview if needed
+      if (toyImageObjectUrlRef.current) {
+        URL.revokeObjectURL(toyImageObjectUrlRef.current);
+        toyImageObjectUrlRef.current = null;
       }
       setToyImage(null);
     } finally {
       setIsLoadingDescription(false);
     }
   };
-  
-  const handleModelChange = (event) => {
-    const file = event.target.files[0];
+
+  const handleModelChange = (evt: Event) => {
+    const el = evt.target as HTMLInputElement;
+    const file = el.files ? el.files[0] : null;
     if (!file) return;
-    if (!file.name.endsWith('.glb')) {
-        handleError('Please upload a .glb model file.');
-        return;
+    if (!file.name.toLowerCase().endsWith('.glb')) {
+      handleError('Please upload a .glb model file.');
+      return;
     }
     setToyModel(file);
   };
 
-
-  const sendCommand = async (commandText) => {
-    if (!commandText || !toyImagePart) return;
-
-    setIsLoadingResponse(true);
-    setToyReply('');
-    setActionImage('');
-    setError('');
-
-    try {
-        const combinedPrompt = `You are an AI Toy Companion. The user's command is: "${commandText}".
-        Based on the user's command and the provided image of the toy, do two things:
-        1.  Generate a short, playful, child-like text reply from the toy's perspective.
-        2.  Generate a new cartoon-style image of the toy performing the action described in the command.
-
-        If the command is too complex, unsafe, or nonsensical for a toy, politely decline in your text reply and do not generate a new image. For example, if the user says "drive a car", you could reply "Vroom vroom! I'm too little to drive a real car, but I can pretend!". In this case, only a text response is needed.
-        For a simple command like "dance", your text reply could be "Whee! I love to dance!" and you should generate an image of the toy dancing.`;
-        
-        const response = await ai.models.generateContent({
-            model: 'gemini-2.5-flash-image-preview',
-            contents: {
-                parts: [
-                    toyImagePart,
-                    { text: combinedPrompt }
-                ],
-            },
-            config: {
-                responseModalities: [Modality.IMAGE, Modality.TEXT],
-            },
-        });
-        
-        let foundText = '';
-        let foundImage = '';
-
-        // The model can output both text and image parts.
-        for (const part of response.candidates[0].content.parts) {
-            if (part.text) {
-                foundText = part.text;
-            } else if (part.inlineData) {
-                const base64ImageBytes = part.inlineData.data;
-                foundImage = `data:image/png;base64,${base64ImageBytes}`;
-            }
-        }
-
-        if (foundText) {
-            setToyReply(foundText);
-        }
-
-        if (foundImage) {
-            setActionImage(foundImage);
-        }
-
-        if (!foundText && !foundImage) {
-            handleError("I'm not sure what to do! Please try another command.");
-        }
-
-    } catch (err) {
-        console.error(err);
-        if (err.toString().toLowerCase().includes('quota')) {
-            handleError("You've reached the daily limit for generating replies. Please try again tomorrow!");
-        } else {
-            handleError('Something went wrong. Please try another command.');
-        }
-    } finally {
-        setIsLoadingResponse(false);
-    }
+  // ---------- Sending commands ----------
+  // debounce/guard to avoid accidental duplicates
+  const canSendNow = () => {
+    const now = Date.now();
+    if (now - lastSendAt < 600) return false;
+    setLastSendAt(now);
+    return true;
   };
 
+  const sendCommand = async (commandText?: string) => {
+    const cmd = (commandText ?? userCommand ?? '').trim();
+    if (!cmd || !toyImagePart) return;
+    if (!canSendNow()) return;
+
+    initializeAudio();
+    playSound('click');
+    setIsLoadingResponse(true);
+    setToyReply('');
+    setActionImage(null);
+    setError('');
+
+    // build prompt
+    const combinedPrompt = `You are an AI Toy Companion. The user's command is: "${cmd}".
+Based on the user's command and the provided image of the toy, do two things:
+1) Generate a short, playful, child-like text reply from the toy's perspective.
+2) If appropriate and safe, generate a new cartoon-style image of the toy performing the action described.
+If the command is unsafe or impossible for a toy, politely decline in text and do not generate an image.`;
+
+    // retry loop for transient errors (but not for quota)
+    let attempt = 0;
+    let lastErr: any = null;
+
+    while (attempt <= SAFE_RETRY_COUNT) {
+      try {
+        abortControllerRef.current = new AbortController();
+        const response = await ai.models.generateContent({
+          model: 'gemini-2.5-flash-image-preview',
+          contents: { parts: [toyImagePart, { text: combinedPrompt }] },
+          config: {
+            responseModalities: [Modality.IMAGE, Modality.TEXT],
+          },
+          // @ts-ignore
+          signal: abortControllerRef.current.signal,
+        });
+
+        // FIX: Robustly parse the multimodal response, using the recommended .text accessor for text
+        // and iterating through parts for image data, avoiding deprecated/incorrect properties.
+        // robust parsing:
+        let foundText = '';
+        let foundImageData = '';
+
+        if (response) {
+          foundText = response.text?.trim() ?? '';
+          const parts = response.candidates?.[0]?.content?.parts || [];
+          for (const part of parts) {
+            if (part.inlineData?.data) {
+              foundImageData = part.inlineData.data;
+              break; // Assume one image part is sufficient
+            }
+          }
+        }
+
+        if (foundText) setToyReply(foundText);
+        if (foundImageData) setActionImage(`data:image/png;base64,${foundImageData}`);
+
+        if (!foundText && !foundImageData) {
+          handleError("I couldn't produce a reply or image. Try a simpler command like 'dance' or 'say hi'.");
+        }
+        lastErr = null;
+        break;
+      } catch (err: any) {
+        lastErr = err;
+        if (isQuotaError(err)) {
+          handleError("Looks like the daily request limit for the AI model has been reached. Please try again tomorrow.");
+          break;
+        }
+        attempt += 1;
+        if (attempt > SAFE_RETRY_COUNT) {
+          console.error('Final error from sendCommand:', err);
+          handleError('Something went wrong while generating the reply. Please try again.');
+          break;
+        }
+        const backoff = RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
+        await sleep(backoff);
+      } finally {
+        abortControllerRef.current = null;
+      }
+    }
+
+    setIsLoadingResponse(false);
+  };
+
+  // ---------- Microphone handling ----------
   const handleMicClick = () => {
     initializeAudio();
-    if (!recognition) {
-        handleError('Voice recognition is not supported in your browser.');
-        return;
+    if (!SpeechRecognition) {
+      handleError('Voice recognition is not supported in your browser.');
+      return;
     }
+
+    // if listening, stop and cleanup
     if (isListening) {
-        recognition.stop();
-        playSound('micOff');
-        setIsListening(false);
-        return;
+      try {
+        recognitionRef.current?.stop();
+      } catch {}
+      playSound('micOff');
+      setIsListening(false);
+      return;
     }
-    
+
     playSound('micOn');
-    recognition.start();
-    recognition.onstart = () => setIsListening(true);
-    recognition.onend = () => setIsListening(false);
-    recognition.onerror = (event) => handleError(`Voice recognition error: ${event.error}`);
-    recognition.onresult = (event) => {
+    // create fresh recognition instance for robustness
+    const recog = new (SpeechRecognition as any)();
+    recog.lang = 'en-US';
+    recog.interimResults = false;
+    recog.maxAlternatives = 1;
+
+    recog.onstart = () => setIsListening(true);
+    recog.onend = () => setIsListening(false);
+    recog.onerror = (event: any) => {
+      setIsListening(false);
+      handleError(`Voice recognition error: ${event?.error || 'unknown'}`);
+    };
+    recog.onresult = (event: any) => {
+      try {
         const transcript = event.results[0][0].transcript;
         setUserCommand(transcript);
         sendCommand(transcript);
+      } catch (err) {
+        console.warn('Error reading recognition result', err);
+      }
     };
-  };
-  
-  const commands = ["say hi", "dance", "jump", "be happy", "be angry", "tell a story"];
 
+    recognitionRef.current = recog;
+    try {
+      recog.start();
+    } catch (err) {
+      handleError('Could not start voice recognition.');
+    }
+  };
+
+  const commands = ['say hi', 'dance', 'jump', 'be happy', 'be angry', 'tell a story'];
+
+  // ---------- Render ----------
   return jsx('div', {
     className: 'container',
     children: [
@@ -488,163 +516,163 @@ function App() {
         children: [
           jsx('h1', { children: 'AI Toy Companion' }),
           !toyImage && jsx('p', { children: 'Upload a picture of your toy and bring it to life!' }),
-          toyImage && jsx('button', {
+          toyImage &&
+            jsx('button', {
               className: 'header-start-over-btn',
               onClick: startOver,
-              children: 'Start Over'
-          })
+              children: 'Start Over',
+            }),
         ],
       }),
       jsx('main', {
-        children: !toyImage
-          ? jsx('div', {
-              className: 'upload-container',
-              children: [
-                jsx(UploadIcon, {}),
-                jsx('h2', { children: "Let's meet your toy!"}),
-                jsx('p', { children: "Upload a photo to get started."}),
-                jsx('input', {
-                  type: 'file',
-                  accept: 'image/*',
-                  onChange: handleFileChange,
-                  ref: fileInputRef,
-                  id: 'file-upload',
-                  'aria-label': 'Upload toy photo',
-                }),
-                 jsx('button', {
-                  onClick: () => {
-                    initializeAudio();
-                    playSound('click');
-                    fileInputRef.current?.click();
-                  },
-                  children: 'Upload Your Toy!',
-                }),
-                jsx('input', {
-                  type: 'file',
-                  accept: '.glb',
-                  onChange: handleModelChange,
-                  ref: modelInputRef,
-                  id: 'model-upload',
-                  style: { display: 'none' }
-                }),
-                jsx('button', {
-                  className: 'secondary-btn',
-                  onClick: () => {
-                    initializeAudio();
-                    playSound('click');
-                    modelInputRef.current?.click()
-                  },
-                  children: 'Optional: Upload 3D Model (.glb)',
-                }),
-              ],
-            })
-          : jsx('div', {
-              className: 'companion-container',
-              children: [
-                jsx('div', {
-                  className: 'toy-panel',
-                  children: [
-                    jsx('img', { src: toyImage, alt: 'User\'s toy', className: 'toy-image' }),
-                    isLoadingDescription && jsx(LoadingSpinner, { text: 'Getting to know your toy...' }),
-                    toyDescription && jsx('p', { className: 'toy-description', children: toyDescription }),
-                     jsx('button', {
-                        className: 'change-toy-btn',
-                        onClick: startOver,
-                        children: 'Start Over'
-                    })
-                  ],
-                }),
-                jsx('div', {
-                  className: 'interaction-panel',
-                  children: [
-                    jsx('div', {
-                      className: 'response-area',
-                      children: [
-                         !isLoadingResponse && !toyReply && !actionImage && jsx('div', { className: 'welcome-message', children: "What should we do next? Try 'catch a ball' or 'tell a story'!" }),
-                        isLoadingResponse && !toyReply && jsx(LoadingSpinner, { text: 'Thinking...' }),
-                        toyReply && jsx('div', {
-                          className: 'speech-bubble',
-                          children: toyReply,
-                        }),
-                        isLoadingResponse && toyReply && jsx(LoadingSpinner, { text: 'Drawing a picture...' }),
-                        (actionImage || toyModel) && jsx('div', {
-                          className: 'media-display-area',
-                          children: [
+        children:
+          !toyImage
+            ? jsx('div', {
+                className: 'upload-container',
+                children: [
+                  jsx(UploadIcon, {}),
+                  jsx('h2', { children: "Let's meet your toy!" }),
+                  jsx('p', { children: 'Upload a photo to get started.' }),
+                  jsx('input', {
+                    type: 'file',
+                    accept: 'image/*',
+                    onChange: handleFileChange,
+                    // FIX: Cast ref to any to resolve TypeScript error due to incorrect type inference for JSX function.
+                    ref: fileInputRef as any,
+                    id: 'file-upload',
+                    'aria-label': 'Upload toy photo',
+                  }),
+                  jsx('button', {
+                    onClick: () => {
+                      initializeAudio();
+                      playSound('click');
+                      fileInputRef.current?.click();
+                    },
+                    children: 'Upload Your Toy!',
+                  }),
+                  jsx('input', {
+                    type: 'file',
+                    accept: '.glb',
+                    onChange: handleModelChange,
+                    // FIX: Cast ref to any to resolve TypeScript error.
+                    ref: modelInputRef as any,
+                    id: 'model-upload',
+                    style: { display: 'none' },
+                  }),
+                  jsx('button', {
+                    className: 'secondary-btn',
+                    onClick: () => {
+                      initializeAudio();
+                      playSound('click');
+                      modelInputRef.current?.click();
+                    },
+                    children: 'Optional: Upload 3D Model (.glb)',
+                  }),
+                ],
+              })
+            : jsx('div', {
+                className: 'companion-container',
+                children: [
+                  jsx('div', {
+                    className: 'toy-panel',
+                    children: [
+                      jsx('img', { src: toyImage, alt: "User's toy", className: 'toy-image' }),
+                      isLoadingDescription && jsx(LoadingSpinner, { text: 'Getting to know your toy...' }),
+                      toyDescription && jsx('p', { className: 'toy-description', children: toyDescription }),
+                      jsx('button', { className: 'change-toy-btn', onClick: startOver, children: 'Start Over' }),
+                    ],
+                  }),
+                  jsx('div', {
+                    className: 'interaction-panel',
+                    children: [
+                      jsx('div', {
+                        className: 'response-area',
+                        children: [
+                          !isLoadingResponse && !toyReply && !actionImage && jsx('div', { className: 'welcome-message', children: "What should we do next? Try 'catch a ball' or 'tell a story'!" }),
+                          isLoadingResponse && !toyReply && jsx(LoadingSpinner, { text: 'Thinking...' }),
+                          toyReply && jsx('div', { className: 'speech-bubble', children: toyReply }),
+                          isLoadingResponse && toyReply && jsx(LoadingSpinner, { text: 'Drawing a picture...' }),
+                          (actionImage || toyModel) && jsx('div', {
+                            className: 'media-display-area',
+                            children: [
                               actionImage && jsx('img', { src: actionImage, alt: 'Generated action by toy', className: 'action-image' }),
-                              toyModel && jsx(ThreeDViewer, { modelFile: toyModel })
-                          ]
-                        })
-                      ],
-                    }),
-                    jsx('div', {
-                      className: 'command-bar',
-                      children: [
-                         jsx('div', {
+                              toyModel && jsx(ThreeDViewer, { modelFile: toyModel }),
+                            ],
+                          }),
+                        ],
+                      }),
+                      jsx('div', {
+                        className: 'command-bar',
+                        children: [
+                          jsx('div', {
                             className: 'preset-commands',
-                            children: commands.map(cmd => jsx('button', {
+                            children: commands.map((cmd) =>
+                              jsx('button', {
                                 onClick: () => {
-                                    initializeAudio();
-                                    playSound('click');
-                                    setUserCommand(cmd);
-                                    sendCommand(cmd);
+                                  initializeAudio();
+                                  playSound('click');
+                                  setUserCommand(cmd);
+                                  sendCommand(cmd);
                                 },
                                 children: cmd.charAt(0).toUpperCase() + cmd.slice(1),
-                            }))
-                        }),
-                        jsx('form', {
-                          className: 'text-command',
-                          onSubmit: (e) => {
-                            e.preventDefault();
-                            initializeAudio();
-                            playSound('click');
-                            sendCommand(userCommand);
-                          },
-                          children: [
-                            jsx('input', {
-                              type: 'text',
-                              value: userCommand,
-                              onInput: (e) => setUserCommand(e.target.value),
-                              placeholder: 'Type a command or use the mic...',
-                              'aria-label': 'Type a command',
-                            }),
-                            recognition && jsx('button', {
+                              })
+                            ),
+                          }),
+                          jsx('form', {
+                            className: 'text-command',
+                            onSubmit: (e: Event) => {
+                              e.preventDefault();
+                              initializeAudio();
+                              playSound('click');
+                              sendCommand(userCommand);
+                            },
+                            children: [
+                              jsx('input', {
+                                type: 'text',
+                                value: userCommand,
+                                onInput: (e: any) => setUserCommand(e.target.value),
+                                placeholder: 'Type a command or use the mic...',
+                                'aria-label': 'Type a command',
+                              }),
+                              SpeechRecognition && jsx('button', {
                                 type: 'button',
                                 onClick: handleMicClick,
                                 className: `mic-button ${isListening ? 'listening' : ''}`,
                                 'aria-label': 'Use voice command',
-                                children: jsx(MicIcon, {})
-                            }),
-                            jsx('button', { type: 'submit', 'aria-label': 'Send command', children: jsx(SendIcon, {}) }),
-                          ],
-                        }),
-                      ],
-                    }),
-                  ],
-                }),
-              ],
-            }),
+                                children: jsx(MicIcon, {}),
+                              }),
+                              jsx('button', { type: 'submit', 'aria-label': 'Send command', children: jsx(SendIcon, {}) }),
+                            ],
+                          }),
+                        ],
+                      }),
+                    ],
+                  }),
+                ],
+              }),
       }),
-      error && jsx('div', { className: 'error-popup', role: 'alert', children: error })
+      error && jsx('div', { className: 'error-popup', role: 'alert', children: error }),
     ],
   });
 }
 
-function ThreeDViewer({ modelFile }) {
-  const mountRef = useRef(null);
+// ---------- 3D Viewer component ----------
+function ThreeDViewer({ modelFile }: { modelFile: File | null }) {
+  const mountRef = useRef<HTMLDivElement | null>(null);
   const [isLoading, setIsLoading] = useState(true);
+  const objectUrlRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (!modelFile || !mountRef.current) return;
-
     setIsLoading(true);
+
     const scene = new THREE.Scene();
     const mount = mountRef.current;
-    
     const camera = new THREE.PerspectiveCamera(75, mount.clientWidth / mount.clientHeight, 0.1, 1000);
     camera.position.z = 5;
 
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-    renderer.setClearColor(0x000000, 0); // Transparent background
+    renderer.setClearColor(0x000000, 0);
     renderer.setSize(mount.clientWidth, mount.clientHeight);
     renderer.setPixelRatio(window.devicePixelRatio);
     mount.appendChild(renderer.domElement);
@@ -661,59 +689,69 @@ function ThreeDViewer({ modelFile }) {
 
     const loader = new GLTFLoader();
     const modelUrl = URL.createObjectURL(modelFile);
+    objectUrlRef.current = modelUrl;
 
-    loader.load(modelUrl, (gltf) => {
-      const model = gltf.scene;
-      const box = new THREE.Box3().setFromObject(model);
-      const center = box.getCenter(new THREE.Vector3());
-      model.position.sub(center);
-      const size = box.getSize(new THREE.Vector3());
-      const maxDim = Math.max(size.x, size.y, size.z);
-      const scale = 5 / maxDim;
-      model.scale.set(scale, scale, scale);
-      scene.add(model);
-      setIsLoading(false);
-    }, undefined, (error) => {
-      console.error('An error happened while loading the model.', error);
-      setIsLoading(false);
-    });
+    loader.load(
+      modelUrl,
+      (gltf) => {
+        const model = gltf.scene;
+        const box = new THREE.Box3().setFromObject(model);
+        const center = box.getCenter(new THREE.Vector3());
+        model.position.sub(center);
+        const size = box.getSize(new THREE.Vector3());
+        const maxDim = Math.max(size.x, size.y, size.z);
+        const scale = maxDim > 0 ? 5 / maxDim : 1;
+        model.scale.set(scale, scale, scale);
+        scene.add(model);
+        setIsLoading(false);
+      },
+      undefined,
+      (err) => {
+        console.error('Error loading GLB', err);
+        setIsLoading(false);
+      }
+    );
 
-    let animationFrameId;
+    let afId: number;
     const animate = () => {
-      animationFrameId = requestAnimationFrame(animate);
+      afId = requestAnimationFrame(animate);
       controls.update();
       renderer.render(scene, camera);
     };
     animate();
 
     const handleResize = () => {
-        if (mountRef.current) {
-            camera.aspect = mountRef.current.clientWidth / mountRef.current.clientHeight;
-            camera.updateProjectionMatrix();
-            renderer.setSize(mountRef.current.clientWidth, mountRef.current.clientHeight);
-        }
+      if (!mountRef.current) return;
+      camera.aspect = mountRef.current.clientWidth / mountRef.current.clientHeight;
+      camera.updateProjectionMatrix();
+      // FIX: renderer.setSize requires width and height as separate arguments.
+      renderer.setSize(mountRef.current.clientWidth, mountRef.current.clientHeight);
     };
     window.addEventListener('resize', handleResize);
 
     return () => {
       window.removeEventListener('resize', handleResize);
-      cancelAnimationFrame(animationFrameId);
-      URL.revokeObjectURL(modelUrl);
-      if (mountRef.current && renderer.domElement) {
-        mountRef.current.removeChild(renderer.domElement);
-      }
+      cancelAnimationFrame(afId);
+      try {
+        URL.revokeObjectURL(modelUrl);
+      } catch {}
+      if (mount && renderer.domElement) mount.removeChild(renderer.domElement);
       renderer.dispose();
-      scene.traverse(object => {
-          if (object instanceof THREE.Mesh) {
-              if(object.geometry) object.geometry.dispose();
-              if(object.material) {
-                  if (Array.isArray(object.material)) {
-                      object.material.forEach(material => material.dispose());
-                  } else {
-                      object.material.dispose();
-                  }
-              }
+      scene.traverse((obj) => {
+        // dispose geometry and materials
+        if ((obj as any).geometry) {
+          try {
+            (obj as any).geometry.dispose();
+          } catch {}
+        }
+        if ((obj as any).material) {
+          const m = (obj as any).material;
+          if (Array.isArray(m)) {
+            m.forEach((mat) => mat.dispose && mat.dispose());
+          } else {
+            m.dispose && m.dispose();
           }
+        }
       });
     };
   }, [modelFile]);
@@ -721,26 +759,24 @@ function ThreeDViewer({ modelFile }) {
   return jsx('div', {
     className: 'threed-viewer-container',
     children: [
-        isLoading && jsx(LoadingSpinner, { text: 'Loading 3D model...' }),
-        jsx('div', { ref: mountRef, className: 'threed-canvas' })
-    ]
+      isLoading && jsx(LoadingSpinner, { text: 'Loading 3D model...' }),
+      // FIX: Cast ref to any to resolve TypeScript error.
+      jsx('div', { ref: mountRef as any, className: 'threed-canvas' }),
+    ],
   });
 }
 
+// ---------- Small UI bits ----------
+const LoadingSpinner = ({ text }: { text: string }) =>
+  jsx('div', { className: 'loading-spinner', 'aria-label': text, role: 'status', children: [jsx('div', { className: 'spinner' }), jsx('p', { children: text })] });
 
-const LoadingSpinner = ({ text }) => jsx('div', {
-    className: 'loading-spinner',
-    'aria-label': text,
-    role: 'status',
-    children: [
-        jsx('div', { className: 'spinner' }),
-        jsx('p', { children: text })
-    ]
-});
+const MicIcon = () =>
+  jsx('svg', { xmlns: 'http://www.w3.org/2000/svg', viewBox: '0 0 24 24', fill: 'currentColor', children: jsx('path', { d: 'M12 14q-1.25 0-2.125-.875T9 11V5q0-1.25.875-2.125T12 2q1.25 0 2.125.875T15 5v6q0 1.25-.875 2.125T12 14Zm-1 7v-3.075q-2.6-.35-4.3-2.325T4 11H6q0 2.075 1.463 3.537T11 16v-1q-2.075 0-3.537-1.463T6 11V5q0-2.5 1.75-4.25T12 0q2.5 0 4.25 1.75T18 5v6q0 2.075-1.463 3.537T13 16v1q2.075 0 3.538-1.463T18 11h2q0 2.525-1.7 4.5T14 17.925V21h-3Z' }) });
 
-const MicIcon = () => jsx('svg', { xmlns: "http://www.w3.org/2000/svg", viewBox: "0 0 24 24", fill: "currentColor", children: jsx('path', { d: "M12 14q-1.25 0-2.125-.875T9 11V5q0-1.25.875-2.125T12 2q1.25 0 2.125.875T15 5v6q0 1.25-.875 2.125T12 14Zm-1 7v-3.075q-2.6-.35-4.3-2.325T4 11H6q0 2.075 1.463 3.537T11 16v-1q-2.075 0-3.537-1.463T6 11V5q0-2.5 1.75-4.25T12 0q2.5 0 4.25 1.75T18 5v6q0 2.075-1.463 3.537T13 16v1q2.075 0 3.538-1.463T18 11h2q0 2.525-1.7 4.5T14 17.925V21h-3Z"}) });
-const SendIcon = () => jsx('svg', { xmlns: "http://www.w3.org/2000/svg", viewBox: "0 0 24 24", fill: "currentColor", children: jsx('path', { d: "M3 20v-6l8-2-8-2V4l19 8-19 8Z" }) });
-const UploadIcon = () => jsx('svg', { className: "upload-icon", xmlns: "http://www.w3.org/2000/svg", viewBox: "0 0 24 24", fill: "currentColor", children: jsx('path', { d: "M11 16V7.85l-2.6 2.6L7 9l5-5 5 5-1.4 1.45-2.6-2.6V16h-2Zm-5 4q-.825 0-1.413-.588T4 18v-3h2v3h12v-3h2v3q0 .825-.588 1.413T18 20H6Z" }) });
+const SendIcon = () => jsx('svg', { xmlns: 'http://www.w3.org/2000/svg', viewBox: '0 0 24 24', fill: 'currentColor', children: jsx('path', { d: 'M3 20v-6l8-2-8-2V4l19 8-19 8Z' }) });
 
+const UploadIcon = () =>
+  jsx('svg', { className: 'upload-icon', xmlns: 'http://www.w3.org/2000/svg', viewBox: '0 0 24 24', fill: 'currentColor', children: jsx('path', { d: 'M11 16V7.85l-2.6 2.6L7 9l5-5 5 5-1.4 1.45-2.6-2.6V16h-2Zm-5 4q-.825 0-1.413-.588T4 18v-3h2v3h12v-3h2v3q0 .825-.588 1.413T18 20H6Z' }) });
 
+// mount to DOM
 render(jsx(App, {}), document.getElementById('app'));
